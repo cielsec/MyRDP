@@ -1,54 +1,85 @@
-name: Ubuntu-TS-SSH
+name: RDP-UBUNTU
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-ssh:
+  ubuntu-rdp:
     runs-on: ubuntu-latest
     timeout-minutes: 3600
 
     steps:
-      - name: Install packages
+      - name: Update + Desktop + XRDP
+        shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-server curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xfce4 xfce4-goodies xrdp dbus-x11 xorgxrdp ufw curl
 
-      - name: Create user and enable SSH
+          # XRDP usando Xfce
+          echo "xfce4-session" | sudo tee /etc/skel/.xsession >/dev/null
+          sudo sed -i 's/^#\?port=.*/port=3389/' /etc/xrdp/xrdp.ini
+
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+          # Firewall local (no runner) - não é o "security group", mas ajuda
+          sudo ufw allow 3389/tcp || true
+          sudo ufw allow 22/tcp || true
+          sudo ufw --force enable || true
+
+      - name: Create RDP user (random strong password)
+        shell: bash
         run: |
-          sudo useradd -m -s /bin/bash rdp
-          PASS="$(openssl rand -base64 18)"
-          echo "rdp:$PASS" | sudo chpasswd
-          sudo usermod -aG sudo rdp
-          sudo systemctl enable --now ssh
-          echo "SSH_USER=rdp" >> $GITHUB_ENV
-          echo "SSH_PASS=$PASS" >> $GITHUB_ENV
+          USER="rdp"
+          PASS="$(tr -dc 'A-Za-z0-9!@#$%^&*()_+=-{}[]:;,.?' </dev/urandom | head -c 28)"
+          sudo useradd -m -s /bin/bash "$USER" || true
+          echo "$USER:$PASS" | sudo chpasswd
+          sudo usermod -aG sudo "$USER" || true
+
+          echo "RDP_USER=$USER" >> $GITHUB_ENV
+          echo "RDP_PASS=$PASS" >> $GITHUB_ENV
 
       - name: Install Tailscale
+        shell: bash
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
 
       - name: Establish Tailscale Connection
+        shell: bash
         run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
-          TS_IP="$(tailscale ip -4 | head -n1)"
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="gh-ubuntu-${{ github.run_id }}" \
+            --accept-dns=false
 
-      - name: Show access info
+          TSIP="$(tailscale ip -4 | head -n1)"
+          if [ -z "$TSIP" ]; then
+            echo "No Tailscale IP."
+            exit 1
+          fi
+          echo "TAILSCALE_IP=$TSIP" >> $GITHUB_ENV
+
+      - name: Verify RDP port locally
+        shell: bash
         run: |
-          echo ""
-          echo "=== SSH ACCESS ==="
-          echo "Address: $TAILSCALE_IP"
-          echo "Port: 22"
-          echo "Username: $SSH_USER"
-          echo "Password: $SSH_PASS"
-          echo "=================="
-          echo ""
+          sudo ss -lntp | grep ':3389' || (echo "XRDP not listening on 3389" && exit 1)
+          echo "XRDP is listening on 3389"
 
       - name: Maintain Connection
+        shell: bash
         run: |
+          echo ""
+          echo "=== RDP ACCESS (UBUNTU) ==="
+          echo "Address: $TAILSCALE_IP:3389"
+          echo "Username: $RDP_USER"
+          echo "Password: $RDP_PASS"
+          echo "Desktop: Xfce"
+          echo "==========================="
+          echo ""
+
           while true; do
-            echo "[$(date)] SSH Active"
+            echo "[$(date)] RDP Active"
             sleep 300
           done
