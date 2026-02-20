@@ -8,20 +8,18 @@
           if [ -n "${{ secrets.RDP_PASSWORD }}" ]; then
             PASS="${{ secrets.RDP_PASSWORD }}"
           else
-            PASS="$(python3 - <<'PY'
-import secrets, string
-alphabet = string.ascii_letters + string.digits + "!@#$%^&*()_+=-{}[]:;,.?"
-print(''.join(secrets.choice(alphabet) for _ in range(28)))
-PY
-)"
+            PASS="$(python3 -c "import secrets,string; alphabet=string.ascii_letters+string.digits+'@#$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(alphabet) for _ in range(28)))")"
           fi
 
           sudo useradd -m -s /bin/bash "$USER" || true
           echo "$USER:$PASS" | sudo chpasswd
           sudo usermod -aG sudo "$USER" || true
 
+          # sessão XFCE pro XRDP
           echo "xfce4-session" | sudo tee "/home/$USER/.xsession" >/dev/null
           sudo chown "$USER:$USER" "/home/$USER/.xsession"
 
-          echo "RDP_USER=$USER" >> "$GITHUB_ENV"
-          echo "RDP_PASS=$PASS" >> "$GITHUB_ENV"
+          {
+            echo "RDP_USER=$USER"
+            echo "RDP_PASS=$PASS"
+          } >> "$GITHUB_ENV"
