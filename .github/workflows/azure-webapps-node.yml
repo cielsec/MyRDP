@@ -1,129 +1,29 @@
-name: RDP-UBUNTU
-
-on:
-  workflow_dispatch:
-
-concurrency:
-  group: rdp-ubuntu
-  cancel-in-progress: true
-
-jobs:
-  ubuntu-rdp:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Sanity check
+      - name: Bring up Tailscale + get IP (robusto)
         shell: bash
         run: |
-          set -e
-          uname -a
-          cat /etc/os-release
+          set -euo pipefail
 
-      - name: Check required secrets
-        shell: bash
-        run: |
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
-            echo "ERRO: Secret TAILSCALE_AUTH_KEY ausente/vazio."
+          # Normaliza o authkey (remove \r e \n caso tenha vindo quebrado do Secrets)
+          TS_AUTHKEY="$(printf '%s' "${{ secrets.TAILSCALE_AUTH_KEY }}" | tr -d '\r\n')"
+
+          if [ -z "$TS_AUTHKEY" ]; then
+            echo "ERRO: TAILSCALE_AUTH_KEY ficou vazio após normalização."
             exit 1
           fi
-          echo "OK: TAILSCALE_AUTH_KEY presente."
 
-      # NÃO derruba o job se XRDP não subir
-      - name: Install Desktop + XRDP (não derruba)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euxo pipefail
+          # Garante daemon online
+          sudo systemctl restart tailscaled || true
+          sleep 2
+          sudo tailscale status || true
 
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xfce4 xfce4-goodies \
-            xrdp xorgxrdp dbus-x11 \
-            curl ufw lsof
-
-          # XFCE como sessão do XRDP
-          echo "xfce4-session" | sudo tee /etc/skel/.xsession >/dev/null
-          sudo sed -i 's|^exec .*|exec xfce4-session|' /etc/xrdp/startwm.sh || true
-
-          sudo adduser xrdp ssl-cert || true
-
-          sudo systemctl daemon-reload || true
-          sudo systemctl enable xrdp || true
-          sudo systemctl restart xrdp xrdp-sesman || true
-
-          sudo ufw allow 3389/tcp || true
-          sudo ufw --force enable || true
-
-          echo "Aguardando XRDP abrir 3389 (até 30s)..."
-          for i in {1..30}; do
-            if sudo ss -lntp | grep -q ':3389'; then
-              echo "XRDP OK: ouvindo em 3389."
-              break
-            fi
-            sleep 1
-          done
-
-          echo "== PORTA 3389 =="
-          sudo ss -lntp | grep -E ':3389\b' || echo "Ainda não há listener em 3389."
-          sudo lsof -iTCP:3389 -sTCP:LISTEN -nP || true
-
-          echo "== STATUS XRDP =="
-          sudo systemctl status xrdp --no-pager -l || true
-          sudo systemctl status xrdp-sesman --no-pager -l || true
-
-          echo "== LOGS XRDP (journal) =="
-          sudo journalctl -u xrdp -n 200 --no-pager || true
-          sudo journalctl -u xrdp-sesman -n 200 --no-pager || true
-
-          echo "== LOGS XRDP (arquivos) =="
-          sudo tail -n 200 /var/log/xrdp.log || true
-          sudo tail -n 200 /var/log/xrdp-sesman.log || true
-
-      - name: Create RDP user (sem broken pipe)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          USER="rdp"
-
-          if [ -n "${{ secrets.RDP_PASSWORD }}" ]; then
-            PASS="${{ secrets.RDP_PASSWORD }}"
-          else
-            PASS="$(python3 -c "import secrets,string; alphabet=string.ascii_letters+string.digits+'@#$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(alphabet) for _ in range(28)))")"
-          fi
-
-          sudo useradd -m -s /bin/bash "$USER" || true
-          echo "$USER:$PASS" | sudo chpasswd
-          sudo usermod -aG sudo "$USER" || true
-
-          echo "xfce4-session" | sudo tee "/home/$USER/.xsession" >/dev/null
-          sudo chown "$USER:$USER" "/home/$USER/.xsession"
-
-          {
-            echo "RDP_USER=$USER"
-            echo "RDP_PASS=$PASS"
-          } >> "$GITHUB_ENV"
-
-      - name: Install Tailscale
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo systemctl enable --now tailscaled
-          tailscale version || true
-
-      - name: Bring up Tailscale + get IP
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          # Sobe com reset (evita config antiga) — sem --unattended
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --reset \
+            --authkey="$TS_AUTHKEY" \
             --hostname="gh-ubuntu-${{ github.run_id }}" \
-            --accept-dns=false \
-            --unattended
+            --accept-dns=false
 
+          # Captura IP
           TSIP=""
           for i in {1..30}; do
             TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -138,53 +38,4 @@ jobs:
           fi
 
           echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
-
-      - name: Show access info
-        shell: bash
-        run: |
-          echo ""
-          echo "=== RDP ACCESS (UBUNTU / XFCE) ==="
-          echo "Address: $TAILSCALE_IP:3389"
-          echo "Username: $RDP_USER"
-          echo "Password: $RDP_PASS"
-          echo "==============================="
-          echo ""
-          echo "Comando no Linux (FreeRDP):"
-          echo "xfreerdp /v:$TAILSCALE_IP:3389 /u:$RDP_USER /p:\"$RDP_PASS\" /cert:ignore /sec:rdp"
-          echo ""
-          echo "Check local listener 3389 (no runner):"
-          sudo ss -lnt | grep -E ':3389\b' && echo "3389: OK" || echo "3389: DOWN"
-
-      - name: Maintain (keep alive + tenta reparar XRDP)
-        shell: bash
-        run: |
-          set +e
-          echo "Runner vivo. Tentando manter XRDP e Tailscale."
-
-          while true; do
-            TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-            PORT="DOWN"
-            sudo ss -lnt | grep -q ':3389' && PORT="OK"
-
-            if [ "$PORT" = "DOWN" ]; then
-              echo "[$(date)] XRDP 3389 DOWN. Restart..."
-              sudo systemctl restart xrdp xrdp-sesman || true
-              sleep 2
-            fi
-
-            if [ -z "$TSIP" ]; then
-              echo "[$(date)] Tailscale sem IP. Reiniciando..."
-              sudo systemctl restart tailscaled || true
-              sleep 2
-              sudo tailscale up \
-                --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-                --hostname="gh-ubuntu-${{ github.run_id }}" \
-                --accept-dns=false \
-                --unattended || true
-              sleep 2
-              TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-            fi
-
-            echo "[$(date)] Alive | TS: ${TSIP:-n/a} | 3389: $PORT"
-            sleep 60
-          done
+          echo "Tailscale IP: $TSIP"
