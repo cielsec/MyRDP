@@ -1,42 +1,125 @@
-      - name: Create SSH user (Ubuntu Server) + enable SSH
+name: Ubuntu-SSH-Tailscale
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ubuntu-ssh
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Sanity check
+        shell: bash
+        run: |
+          set -e
+          uname -a
+          cat /etc/os-release
+
+      - name: Check required secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "ERRO: Secret TAILSCALE_AUTH_KEY ausente/vazio."
+            exit 1
+          fi
+          echo "OK: TAILSCALE_AUTH_KEY presente."
+
+      - name: Install OpenSSH + Create SSH user
         shell: bash
         run: |
           set -euo pipefail
 
           USER="sshuser"
 
-          # senha: usa secret se existir, senão gera uma
           if [ -n "${{ secrets.SSH_PASSWORD }}" ]; then
             PASS="${{ secrets.SSH_PASSWORD }}"
           else
             PASS="$(python3 -c "import secrets,string; a=string.ascii_letters+string.digits+'@#$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(a) for _ in range(28)))")"
           fi
 
-          # instala SSH server
           sudo apt-get update
-          sudo apt-get install -y openssh-server
+          sudo apt-get install -y openssh-server ufw curl
 
-          # cria usuário e seta senha
           sudo useradd -m -s /bin/bash "$USER" || true
           echo "$USER:$PASS" | sudo chpasswd
           sudo usermod -aG sudo "$USER" || true
 
-          # configura sshd para permitir login por senha (se você preferir chave, me fala)
           sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
 
-          # abre porta (no runner isso nem sempre é “necessário”, mas ok)
-          sudo ufw allow 22/tcp || true
-          sudo ufw --force enable || true
-
-          # restart do ssh
           sudo systemctl enable ssh || true
           sudo systemctl restart ssh
 
-          # exporta pro restante do workflow
+          sudo ufw allow 22/tcp || true
+          sudo ufw --force enable || true
+
           {
             echo "SSH_USER=$USER"
             echo "SSH_PASS=$PASS"
           } >> "$GITHUB_ENV"
 
-          echo "SSH configurado. User: $USER"
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          tailscale version || true
+
+      - name: Bring up Tailscale + get IP (robusto)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TS_AUTHKEY="$(printf '%s' "${{ secrets.TAILSCALE_AUTH_KEY }}" | tr -d '\r\n')"
+
+          sudo tailscale up \
+            --reset \
+            --authkey="$TS_AUTHKEY" \
+            --hostname="gh-ubuntu-${{ github.run_id }}" \
+            --accept-dns=false
+
+          TSIP=""
+          for i in {1..30}; do
+            TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+            [ -n "$TSIP" ] && break
+            sleep 1
+          done
+
+          if [ -z "$TSIP" ]; then
+            echo "ERRO: Tailscale não atribuiu IP."
+            tailscale status || true
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
+
+      - name: Show access info
+        shell: bash
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Host: $TAILSCALE_IP"
+          echo "User: $SSH_USER"
+          echo "Pass: $SSH_PASS"
+          echo ""
+          echo "Comando:"
+          echo "ssh $SSH_USER@$TAILSCALE_IP"
+          echo "==============="
+          echo ""
+          sudo ss -lnt | grep -E ':22\b' && echo "SSH: OK (22)" || echo "SSH: DOWN"
+
+      - name: Keep alive
+        shell: bash
+        run: |
+          set +e
+          echo "Runner vivo até timeout."
+          while true; do
+            echo "[$(date)] Alive | TS: $(tailscale ip -4 2>/dev/null | head -n1 || echo n/a)"
+            sleep 60
+          done
