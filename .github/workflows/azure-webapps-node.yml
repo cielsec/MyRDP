@@ -1,29 +1,89 @@
+name: Ubuntu-SSH-Tailscale
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ubuntu-ssh
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Sanity check
+        shell: bash
+        run: |
+          set -e
+          uname -a
+          cat /etc/os-release
+
+      - name: Check required secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "ERRO: Secret TAILSCALE_AUTH_KEY ausente/vazio."
+            exit 1
+          fi
+          echo "OK: TAILSCALE_AUTH_KEY presente."
+
+      - name: Install OpenSSH + Create SSH user
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          USER="sshuser"
+
+          if [ -n "${{ secrets.SSH_PASSWORD }}" ]; then
+            PASS="${{ secrets.SSH_PASSWORD }}"
+          else
+            PASS="$(python3 -c "import secrets,string; a=string.ascii_letters+string.digits+'@#$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(a) for _ in range(28)))")"
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y openssh-server ufw curl
+
+          sudo useradd -m -s /bin/bash "$USER" || true
+          echo "$USER:$PASS" | sudo chpasswd
+          sudo usermod -aG sudo "$USER" || true
+
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
+
+          sudo systemctl enable ssh || true
+          sudo systemctl restart ssh
+
+          sudo ufw allow 22/tcp || true
+          sudo ufw --force enable || true
+
+          {
+            echo "SSH_USER=$USER"
+            echo "SSH_PASS=$PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Tailscale
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled
+          tailscale version || true
+
       - name: Bring up Tailscale + get IP (robusto)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Normaliza o authkey (remove \r e \n caso tenha vindo quebrado do Secrets)
           TS_AUTHKEY="$(printf '%s' "${{ secrets.TAILSCALE_AUTH_KEY }}" | tr -d '\r\n')"
 
-          if [ -z "$TS_AUTHKEY" ]; then
-            echo "ERRO: TAILSCALE_AUTH_KEY ficou vazio após normalização."
-            exit 1
-          fi
-
-          # Garante daemon online
-          sudo systemctl restart tailscaled || true
-          sleep 2
-          sudo tailscale status || true
-
-          # Sobe com reset (evita config antiga) — sem --unattended
           sudo tailscale up \
             --reset \
             --authkey="$TS_AUTHKEY" \
             --hostname="gh-ubuntu-${{ github.run_id }}" \
             --accept-dns=false
 
-          # Captura IP
           TSIP=""
           for i in {1..30}; do
             TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -38,4 +98,28 @@
           fi
 
           echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
-          echo "Tailscale IP: $TSIP"
+
+      - name: Show access info
+        shell: bash
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Host: $TAILSCALE_IP"
+          echo "User: $SSH_USER"
+          echo "Pass: $SSH_PASS"
+          echo ""
+          echo "Comando:"
+          echo "ssh $SSH_USER@$TAILSCALE_IP"
+          echo "==============="
+          echo ""
+          sudo ss -lnt | grep -E ':22\b' && echo "SSH: OK (22)" || echo "SSH: DOWN"
+
+      - name: Keep alive
+        shell: bash
+        run: |
+          set +e
+          echo "Runner vivo até timeout."
+          while true; do
+            echo "[$(date)] Alive | TS: $(tailscale ip -4 2>/dev/null | head -n1 || echo n/a)"
+            sleep 60
+          done
