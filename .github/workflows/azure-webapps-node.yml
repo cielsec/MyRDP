@@ -16,52 +16,44 @@ jobs:
       - name: Sanity check
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           uname -a
           cat /etc/os-release
+          whoami
+          id
 
-      - name: Check required secrets
+      - name: Install OpenSSH + create user (password login ON)
         shell: bash
-        run: |
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
-            echo "ERRO: Secret TAILSCALE_AUTH_KEY ausente/vazio."
-            exit 1
-          fi
-          echo "OK: TAILSCALE_AUTH_KEY presente."
-
-      - name: Install OpenSSH + Create SSH user
-        shell: bash
+        env:
+          SSH_PASSWORD: ${{ secrets.SSH_PASSWORD }}
         run: |
           set -euo pipefail
-
           USER="sshuser"
 
-          if [ -n "${{ secrets.SSH_PASSWORD }}" ]; then
-            PASS="${{ secrets.SSH_PASSWORD }}"
+          if [ -n "${SSH_PASSWORD}" ]; then
+            PASS="${SSH_PASSWORD}"
           else
-            PASS="$(python3 -c "import secrets,string; a=string.ascii_letters+string.digits+'@#$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(a) for _ in range(28)))")"
+            PASS="$(python3 -c "import secrets,string; a=string.ascii_letters+string.digits+'@#\$%^&*()_+=-{}[]:;,.?'; print(''.join(secrets.choice(a) for _ in range(28)))")"
           fi
 
           sudo apt-get update
-          sudo apt-get install -y openssh-server ufw curl
+          sudo apt-get install -y openssh-server curl jq netcat-openbsd ufw
 
           sudo useradd -m -s /bin/bash "$USER" || true
           echo "$USER:$PASS" | sudo chpasswd
           sudo usermod -aG sudo "$USER" || true
 
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          echo "PasswordAuthentication yes" | sudo tee /etc/ssh/sshd_config.d/99-gh-actions.conf >/dev/null
+          echo "KbdInteractiveAuthentication yes" | sudo tee -a /etc/ssh/sshd_config.d/99-gh-actions.conf >/dev/null
+          echo "UsePAM yes" | sudo tee -a /etc/ssh/sshd_config.d/99-gh-actions.conf >/dev/null
+          echo "PermitRootLogin no" | sudo tee -a /etc/ssh/sshd_config.d/99-gh-actions.conf >/dev/null
 
-          sudo systemctl enable ssh || true
+          sudo systemctl enable ssh
           sudo systemctl restart ssh
 
-          sudo ufw allow 22/tcp || true
-          sudo ufw --force enable || true
-
-          {
-            echo "SSH_USER=$USER"
-            echo "SSH_PASS=$PASS"
-          } >> "$GITHUB_ENV"
+          echo "SSH_USER=$USER" >> "$GITHUB_ENV"
+          echo "SSH_PASS=$PASS" >> "$GITHUB_ENV"
 
       - name: Install Tailscale
         shell: bash
@@ -69,57 +61,91 @@ jobs:
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo systemctl enable --now tailscaled
-          tailscale version || true
+          tailscale version
 
-      - name: Bring up Tailscale + get IP (robusto)
+      - name: Tailscale up (AUTHKEY, non-interactive)
         shell: bash
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           set -euo pipefail
 
-          TS_AUTHKEY="$(printf '%s' "${{ secrets.TAILSCALE_AUTH_KEY }}" | tr -d '\r\n')"
+          if [ -z "${TS_AUTHKEY:-}" ]; then
+            echo "ERRO: defina o secret TS_AUTHKEY no repo."
+            exit 1
+          fi
 
-          sudo tailscale up \
-            --reset \
-            --authkey="$TS_AUTHKEY" \
-            --hostname="gh-ubuntu-${{ github.run_id }}" \
-            --accept-dns=false
+          sudo tailscale up --reset --authkey "$TS_AUTHKEY" --hostname "gh-ubuntu-${{ github.run_id }}" --accept-dns=false
 
-          TSIP=""
-          for i in {1..30}; do
-            TSIP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-            [ -n "$TSIP" ] && break
+          for i in $(seq 1 60); do
+            ONLINE="$(tailscale status --json | jq -r '.Self.Online')"
+            if [ "$ONLINE" = "true" ]; then
+              break
+            fi
+            echo "Aguardando Tailscale ficar Online... ($i/60)"
             sleep 1
           done
 
+          ONLINE="$(tailscale status --json | jq -r '.Self.Online')"
+          if [ "$ONLINE" != "true" ]; then
+            echo "ERRO: Tailscale não ficou Online."
+            tailscale status || true
+            exit 1
+          fi
+
+          TSIP="$(tailscale ip -4 | head -n1)"
           if [ -z "$TSIP" ]; then
-            echo "ERRO: Tailscale não atribuiu IP."
+            echo "ERRO: Online, mas sem IPv4."
             tailscale status || true
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TSIP" >> "$GITHUB_ENV"
 
+      - name: Firewall - allow SSH only via tailscale0
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo ufw --force reset
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw allow in on tailscale0 to any port 22 proto tcp
+          sudo ufw --force enable
+          sudo ufw status verbose
+
+      - name: Validate services
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "--- SSHD status ---"
+          sudo systemctl --no-pager -l status ssh
+          echo "--- Listening ports ---"
+          sudo ss -lntp | grep -E ":(22)\b" || (echo "ERRO: sshd não está ouvindo na 22" && exit 1)
+          echo "--- Local connect test (localhost:22) ---"
+          nc -vz 127.0.0.1 22 || true
+          echo "--- Tailscale status (resumo) ---"
+          tailscale status --json | jq '{BackendState: .BackendState, Online: .Self.Online, DNSName: .Self.DNSName, TailscaleIPs: .Self.TailscaleIPs}'
+
       - name: Show access info
         shell: bash
         run: |
+          set -euo pipefail
           echo ""
-          echo "=== SSH ACCESS ==="
+          echo "=============================="
+          echo "SSH ACCESS (OpenSSH via Tailscale IP)"
           echo "Host: $TAILSCALE_IP"
           echo "User: $SSH_USER"
           echo "Pass: $SSH_PASS"
           echo ""
-          echo "Comando:"
+          echo "No seu PC:"
           echo "ssh $SSH_USER@$TAILSCALE_IP"
-          echo "==============="
+          echo "=============================="
           echo ""
-          sudo ss -lnt | grep -E ':22\b' && echo "SSH: OK (22)" || echo "SSH: DOWN"
 
-      - name: Keep alive
+      - name: Install and start tmate
         shell: bash
         run: |
-          set +e
-          echo "Runner vivo até timeout."
-          while true; do
-            echo "[$(date)] Alive | TS: $(tailscale ip -4 2>/dev/null | head -n1 || echo n/a)"
-            sleep 60
-          done
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y tmate
+          tmate -F
